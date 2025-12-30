@@ -2,21 +2,7 @@
 
 **Mars doesn't just win — it gaslights you first.**
 
-
-
-
-
-
-
-
 A highly realistic, brutally difficult **Gymnasium** reinforcement learning environment simulating a crewed Mars surface habitat. This is not a toy problem — it integrates real physics, ISRU chains, 3D printing expansion, battery aging, dust storms, radiation, and (in V17) direct ports of failure modes from NASA's **CHAPEA** and **HI-SEAS** analog missions: water leaks, comms blackouts, and psychological sabotage.
-
-
-
-
-
-
-
 
 Built from first principles with credible engineering parameters. The goal: achieve permanent human presence on Mars despite cascading failures and human factors.
 
@@ -34,13 +20,6 @@ Built from first principles with credible engineering parameters. The goal: achi
   - Unreliable resupply windows every ~26 months
 - **Human factors**: Crew health/mood dynamically affect performance and trigger despair termination
 - Dense reward shaping + survival objective (10+ year missions possible... in theory)
-
-
-
-
-
-
-
 
 ## Installation
 
