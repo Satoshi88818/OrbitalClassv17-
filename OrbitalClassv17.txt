@@ -1,0 +1,708 @@
+#!/usr/bin/env python3
+"""
+V17 OrbitalClass++ — Analog Apocalypse Edition
+================================================================
+Now with NASA-CHAPEA/HI-SEAS failure ports: Water leaks, comms blackouts, psych sabotage.
+Mars doesn't just win—it gaslights you first.
+
+Author: Anonymous Mars Settler → Upgraded to V17 by Grok (Dec 1 2025)
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import math
+import random
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import gymnasium as gym
+import numpy as np
+import yaml
+from pydantic import BaseModel, Field
+
+# =============================================================================
+# CONSTANTS & CONFIG
+# =============================================================================
+
+SOL_HOURS = 24.657551
+HOURS_PER_SOL = SOL_HOURS
+SECONDS_PER_SOL = HOURS_PER_SOL * 3600
+DT_HOURS = 1.0
+DT_SOL = DT_HOURS / HOURS_PER_SOL
+
+MARS_GRAVITY = 3.72
+AVG_INSOLATION_W_M2 = 147.0
+
+# Crew consumption per person per SOL
+CREW_O2_KG_SOL = 0.90
+CREW_CO2_KG_SOL = 1.00
+CREW_WATER_DRINK_KG_SOL = 2.5
+CREW_WATER_HYGIENE_KG_SOL = 5.0
+CREW_FOOD_KG_SOL = 0.62
+CREW_EVA_O2_KG_PER_H = 0.5
+CREW_EVA_TIME_H_PER_PART = 4.0
+
+# Radiation
+BASE_GCR_SV_PER_SOL = 0.00177
+SPE_FLARE_SV = 2.0  # Can be lethal without shelter
+
+# Synodic period for resupply
+SYNODIC_MONTHS = 26.0 * 30  # ~26 months between windows
+
+ACTION_DESCRIPTIONS = [
+    "Heater power fraction (0-1 → 0-15 kW)",                     # 0
+    "Core habitat systems power (0-1 → 0-20 kW total)",          # 1-9 (granular later)
+    "Unused", "Unused", "Unused", "Unused", "Unused", "Unused", "Unused",       # 2-9
+    "Crop lighting intensity (0-1)",                            # 10
+    "Fish tank systems (0-1)",                                  # 11
+    "Chicken coop systems (0-1)",                               # 12
+    "MOXIE (CO2 → O2) fraction (0-1)",                         # 13
+    "Sabatier (CO2 + H2 → CH4 + H2O) fraction (0-1)",           # 14
+    "Water recycling intensity (0-1)",                          # 15
+    "Atmospheric processor intensity (0-1)",                    # 16
+    "Regolith mining rover power fraction (0-1)",               # 17
+    "Pyrolysis (CH4 → plastic) fraction (0-1)",                 # 18
+    "Printer enable fraction (0-1)",                            # 19
+    "Queue solar_panel job (pulse >0.8)",                       # 20
+    "Queue regolith_bag job (pulse >0.8)",                      # 21
+    "Queue structure_brace job (pulse >0.8)",                   # 22
+    "Queue o2_filter job (pulse >0.8)",                         # 23
+    "Queue tool_kit job (pulse >0.8)",                          # 24
+    "Apply printed part: solar_panel (EVA pulse >0.8)",         # 25
+    "Apply printed part: regolith_bag (EVA pulse >0.8)",        # 26
+    "Repair printer with tool_kit (EVA pulse >0.8)",            # 27
+]
+
+@dataclass
+class PrintingConfig:
+    printer_power_kw: float = 8.0
+    print_speed_kg_per_h: float = 0.15
+    pyrolysis_efficiency: float = 0.78
+    success_probability_base: float = 0.96
+    failure_refund: float = 0.65
+    clog_probability_per_kg: float = 0.0008
+    max_queue: int = 15
+    max_inventory: int = 30
+    # V17: Regolith abrasive wear from 3D Habitat Challenge
+    regolith_wear_rate: float = 1e-5  # Per kg mined/printed
+
+    part_types: Dict[str, Dict[str, Any]] = field(default_factory=lambda: {
+        "solar_panel":     {"mass_kg": 6.0,  "value": 25.0, "type": "solar",      "name": "Solar Panel (+25 m²)"},
+        "regolith_bag":    {"mass_kg": 50.0, "value": 0.30, "type": "shielding",  "name": "Regolith Bag (+0.3 m)"},
+        "structure_brace": {"mass_kg": 4.0,  "value": 0.12, "type": "structure",  "name": "Structure Brace"},
+        "o2_filter":       {"mass_kg": 1.0,  "value": 0.25, "type": "o2",         "name": "O2 Filter"},
+        "tool_kit":        {"mass_kg": 0.4,  "value": 0.18, "type": "printer",    "name": "Tool Kit"},
+    })
+
+
+class DifficultyConfig(BaseModel):
+    name: str = "Nightmare"
+    global_storm_freq_years: float = 3.5
+    global_storm_duration_months: float = 4.0
+    spe_freq_per_year: float = 1.2
+    equipment_degradation_rate: float = 1.0
+    battery_aging_rate: float = 1.0
+    eva_risk_multiplier: float = 1.0
+    # V17: Ported from CHAPEA/HI-SEAS
+    water_leak_freq_sol: float = 0.05  # 5% per sol
+    comms_blackout_prob: float = 0.01  # 1% per sol, lasts 1-3 sols
+    psych_sabotage_threshold: float = 30.0  # Mood < this → 2% sabotage chance
+    resupply_window_months: float = SYNODIC_MONTHS
+
+
+class MarsConfig(BaseModel):
+    crew_size: int = 6
+    initial_solar_m2: float = 400.0
+    initial_volume_m3: float = 500.0
+    initial_shielding_m: float = 0.20
+    initial_spares_kg: float = 200.0  # V17: Prefab resupply buffer
+
+    target_temp_c: float = 22.0
+    target_o2_percent: float = 21.0
+    target_co2_ppm: float = 400.0
+
+    crop_growth_rate_per_sol: float = 0.045
+    crop_edible_fraction: float = 0.28
+    crop_light_efficiency: float = 0.65
+
+    difficulty: DifficultyConfig = DifficultyConfig()
+
+    class Config:
+        extra = "allow"
+
+
+# =============================================================================
+# SUBSYSTEMS
+# =============================================================================
+
+@dataclass
+class PrintJob:
+    part_type: str
+    mass_kg: float
+    progress_kg: float = 0.0
+
+
+class PrintingSystem:
+    def __init__(self, cfg: PrintingConfig):
+        self.cfg = cfg
+        self.queue: deque[PrintJob] = deque()
+        self.current: Optional[PrintJob] = None
+        self.inventory: Dict[str, int] = {k: 0 for k in cfg.part_types}
+        self.printer_health: float = 1.0  # 0 = clogged/broken
+        self.printed_mass_since_clog_check: float = 0.0
+        # V17: Abrasive wear from regolith (Habitat Challenge port)
+        self.total_regolith_processed_kg: float = 0.0
+
+    def enqueue(self, part: str) -> bool:
+        if len(self.queue) >= self.cfg.max_queue or part not in self.cfg.part_types:
+            return False
+        spec = self.cfg.part_types[part]
+        self.queue.append(PrintJob(part, spec["mass_kg"]))
+        return True
+
+    def update(self, state: "SystemState", battery: "Battery", enable_frac: float, pyrolysis_frac: float, regolith_used: float) -> float:
+        reward = 0.0
+        cfg = self.cfg
+
+        # V17: Regolith wear
+        self.total_regolith_processed_kg += regolith_used
+        wear = self.total_regolith_processed_kg * cfg.regolith_wear_rate
+        self.printer_health = max(0.1, self.printer_health - wear * DT_SOL)
+
+        # Pyrolysis
+        if pyrolysis_frac > 0.7 and state.methane_kg > 1.0:
+            ch4_used = min(state.methane_kg, pyrolysis_frac * 15.0 * DT_HOURS)
+            plastic_produced = ch4_used * (12.0 / 16.0) * cfg.pyrolysis_efficiency
+            state.plastic_kg += plastic_produced
+            state.methane_kg -= ch4_used
+            reward += plastic_produced * 0.015
+
+        # Start new job if idle
+        if self.current is None and self.queue and self.printer_health > 0.1:
+            self.current = self.queue.popleft()
+            if state.plastic_kg < self.current.mass_kg:
+                self.current = None
+                return reward
+            state.plastic_kg -= self.current.mass_kg
+
+        # Printing
+        if self.current and enable_frac > 0.6 and self.printer_health > 0.1:
+            power_kw = cfg.printer_power_kw * enable_frac
+            if battery.discharge(power_kw, DT_HOURS) > 0.01:
+                kg_this_step = cfg.print_speed_kg_per_h * DT_HOURS * self.printer_health
+                self.printed_mass_since_clog_check += kg_this_step
+                self.current.progress_kg += kg_this_step
+
+                # Random clog (enhanced by wear)
+                clog_prob = self.printed_mass_since_clog_check * cfg.clog_probability_per_kg * (1 + wear)
+                if random.random() < clog_prob:
+                    self.printer_health = 0.0
+                    self.printed_mass_since_clog_check = 0.0
+                    reward -= 8.0
+
+                if self.current.progress_kg >= self.current.mass_kg:
+                    success_prob = cfg.success_probability_base * (0.8 + 0.2 * state.crew_mood / 100.0)
+                    if random.random() < success_prob:
+                        self.inventory[self.current.part_type] = min(
+                            cfg.max_inventory,
+                            self.inventory[self.current.part_type] + 1
+                        )
+                        reward += 4.0
+                    else:
+                        refund = self.current.mass_kg * cfg.failure_refund
+                        state.plastic_kg += refund
+                        reward -= 2.0
+                    self.current = None
+                    self.printed_mass_since_clog_check = 0.0
+
+        return reward
+
+    def apply_part(self, part: str, state: "SystemState") -> bool:
+        if self.inventory.get(part, 0) > 0:
+            self.inventory[part] -= 1
+            spec = self.cfg.part_types[part]
+            if spec["type"] == "solar":
+                state.solar_area_m2 += spec["value"]
+            elif spec["type"] == "shielding":
+                state.shielding_m += spec["value"]
+            return True
+        return False
+
+    def repair(self, state: "SystemState") -> bool:
+        if self.inventory.get("tool_kit", 0) > 0 and self.printer_health < 0.9:
+            self.inventory["tool_kit"] -= 1
+            self.printer_health = 1.0
+            return True
+        return False
+
+
+@dataclass
+class Battery:
+    capacity_kwh_initial: float = 1400.0
+    capacity_kwh: float = field(init=False)
+    max_dod: float = 0.92
+    charge_efficiency: float = 0.95
+    discharge_efficiency: float = 0.93
+    energy_kwh: float = field(default=700.0)
+    total_cycles: float = 0.0
+
+    def __post_init__(self):
+        self.capacity_kwh = self.capacity_kwh_initial
+
+    def charge(self, kw: float, dt_hours: float = DT_HOURS) -> float:
+        room = self.capacity_kwh * self.max_dod - self.energy_kwh
+        added = min(kw * dt_hours * self.charge_efficiency, room)
+        self.energy_kwh += added
+        return added / dt_hours
+
+    def discharge(self, kw: float, dt_hours: float = DT_HOURS) -> float:
+        available = self.energy_kwh
+        taken = min(kw * dt_hours / self.discharge_efficiency, available)
+        self.energy_kwh -= taken
+        self.energy_kwh = max(0.0, self.energy_kwh)
+        self.total_cycles += taken / (self.capacity_kwh_initial * 2)  # Wh throughput → cycles
+        return taken / dt_hours
+
+    def soc(self) -> float:
+        return self.energy_kwh / self.capacity_kwh
+
+    def age(self, difficulty_rate: float = 1.0):
+        # Simplified Severson-style aging: capacity fade ∝ sqrt(cycles) + deep DoD stress
+        fade = 0.00015 * math.sqrt(self.total_cycles * difficulty_rate)
+        if self.energy_kwh < self.capacity_kwh * 0.2:
+            fade += 0.0003 * difficulty_rate
+        self.capacity_kwh = max(100.0, self.capacity_kwh_initial * (1.0 - fade))
+
+
+@dataclass
+class DustStorm:
+    active: bool = False
+    tau: float = 0.5  # optical depth (0.5 = clear, 5.0+ = global storm)
+    duration_left_hours: float = 0.0
+
+    def update(self, time_sol: float, difficulty: DifficultyConfig):
+        if not self.active:
+            if random.random() < 1.0 / (difficulty.global_storm_freq_years * 365.25 * 24 / DT_HOURS):
+                self.active = True
+                self.duration_left_hours = difficulty.global_storm_duration_months * 30 * 24
+                self.tau = random.uniform(4.0, 7.0)
+        else:
+            self.duration_left_hours -= DT_HOURS
+            if self.duration_left_hours <= 0:
+                self.active = False
+                self.tau = 0.5
+            else:
+                self.tau = max(0.5, self.tau * 0.999)  # slow clear
+
+
+# V17: Analog Failure Manager (ports CHAPEA/HI-SEAS logs)
+@dataclass
+class AnalogFailures:
+    water_leak_active: bool = False
+    leak_duration_sols: float = 0.0
+    comms_blackout_active: bool = False
+    blackout_duration_sols: float = 0.0
+    last_resupply_sol: float = 0.0
+    spares_kg: float = 200.0  # Prefab parts buffer
+
+    def update(self, state: "SystemState", difficulty: DifficultyConfig, action: np.ndarray):
+        d = difficulty
+        s = state
+        reward_mod = 0.0
+
+        # Water leak (HI-SEAS port: 5% freq, drains hygiene)
+        if not self.water_leak_active and random.random() < d.water_leak_freq_sol * DT_SOL:
+            self.water_leak_active = True
+            self.leak_duration_sols = random.uniform(1.0, 3.0)  # 1-3 sols
+            s.water_kg -= CREW_WATER_HYGIENE_KG_SOL * s.config.crew_size * 0.1  # 10% loss
+            reward_mod -= 5.0
+        if self.water_leak_active:
+            self.leak_duration_sols -= DT_SOL
+            if self.leak_duration_sols <= 0:
+                self.water_leak_active = False
+            else:
+                s.water_kg -= CREW_WATER_HYGIENE_KG_SOL * s.config.crew_size * 0.05 * DT_SOL
+                reward_mod -= 2.0
+
+        # Comms blackout (HI-SEAS/CHAPEA: 1% freq, 1-3 sols, mood hit)
+        if not self.comms_blackout_active and random.random() < d.comms_blackout_prob * DT_SOL:
+            self.comms_blackout_active = True
+            self.blackout_duration_sols = random.uniform(1.0, 3.0)
+            s.crew_mood -= 10.0  # Isolation stress
+            reward_mod -= 3.0
+        if self.comms_blackout_active:
+            self.blackout_duration_sols -= DT_SOL
+            if self.blackout_duration_sols <= 0:
+                self.comms_blackout_active = False
+            else:
+                s.crew_mood -= 5.0 * DT_SOL
+                reward_mod -= 1.0
+
+        # Resupply window (every synodic, but "delayed" by blackout)
+        months_passed = s.time_sol / 30.0
+        if months_passed - self.last_resupply_sol > d.resupply_window_months and not self.comms_blackout_active:
+            if random.random() < 0.8:  # 80% success rate (analog unreliability)
+                self.spares_kg += 200.0  # Add prefab tool_kits/o2_filters
+                self.inventory["tool_kit"] += 5  # Example: Extra kits
+                reward_mod += 10.0
+            self.last_resupply_sol = months_passed
+
+        # Psych sabotage (CHAPEA stress port: Low mood → override action)
+        if s.crew_mood < d.psych_sabotage_threshold and random.random() < 0.02 * DT_SOL:
+            # Randomly sabotage an action (e.g., overheat or skip repair)
+            sabotage_idx = random.randint(0, len(action)-1)
+            action[sabotage_idx] = random.uniform(0.0, 0.3)  # Nerf it
+            s.crew_mood -= 5.0
+            reward_mod -= 15.0  # Big penalty for "crew error"
+
+        return reward_mod
+
+
+@dataclass
+class SystemState:
+    # Atmosphere
+    o2_kg: float = 105.0
+    co2_kg: float = 0.2
+    n2_kg: float = 380.0
+
+    # Resources
+    water_kg: float = 3000.0
+    food_kg: float = 1200.0
+    plastic_kg: float = 250.0
+    methane_kg: float = 0.0
+    hydrogen_kg: float = 50.0
+    regolith_kg: float = 5000.0
+
+    # Biology
+    crop_biomass_kg: float = 80.0
+    fish_kg: float = 25.0
+    chicken_kg: float = 15.0
+
+    # Habitat
+    volume_m3: float = 500.0
+    shielding_m: float = 0.20
+    solar_area_m2: float = 400.0
+    temp_c: float = 20.0
+
+    # Crew
+    crew_health: float = 100.0
+    crew_mood: float = 100.0
+    radiation_dose_sv: float = 0.0
+
+    # Equipment (0-1)
+    equipment: Dict[str, float] = field(default_factory=lambda: {
+        "structure": 1.0, "solar": 1.0, "o2": 1.0, "co2": 1.0, "printer": 1.0, "mining": 1.0
+    })
+
+    time_sol: float = 0.0
+    config: MarsConfig = field(default_factory=MarsConfig)  # V17: Embed config
+
+    def total_air_kg(self) -> float:
+        return self.o2_kg + self.co2_kg + self.n2_kg
+
+    def o2_percent(self) -> float:
+        total = self.total_air_kg()
+        return 100.0 * self.o2_kg / total if total > 1.0 else 21.0
+
+    def co2_ppm(self) -> float:
+        total = self.total_air_kg()
+        return (self.co2_kg / total) * 1e6 if total > 1.0 else 400.0
+
+
+# =============================================================================
+# ENVIRONMENT
+# =============================================================================
+
+class MarsHabitatEnv(gym.Env):
+    metadata = {"render_modes": []}
+
+    def __init__(self, config: MarsConfig | None = None):
+        super().__init__()
+        self.config = config or MarsConfig()
+        self.print_cfg = PrintingConfig()
+        self.state = SystemState()
+        self.state.config = self.config
+        self.state.solar_area_m2 = self.config.initial_solar_m2
+        self.state.volume_m3 = self.config.initial_volume_m3
+        self.state.shielding_m = self.config.initial_shielding_m
+
+        self.battery = Battery()
+        self.printing = PrintingSystem(self.print_cfg)
+        self.dust_storm = DustStorm()
+        self.failures = AnalogFailures()  # V17
+
+        self.action_space = gym.spaces.Box(low=0.0, high=1.0, shape=(28,), dtype=np.float32)
+        self.observation_space = gym.spaces.Box(low=-5, high=5, shape=(46,), dtype=np.float32)  # +4 for failures
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        self.state = SystemState()
+        self.state.config = self.config
+        self.state.solar_area_m2 = self.config.initial_solar_m2
+        self.state.volume_m3 = self.config.initial_volume_m3
+        self.state.shielding_m = self.config.initial_shielding_m
+        self.battery = Battery()
+        self.battery.energy_kwh = self.battery.capacity_kwh * 0.5
+        self.printing = PrintingSystem(self.print_cfg)
+        self.dust_storm = DustStorm()
+        self.failures = AnalogFailures()
+        return self._get_obs(), {"config": self.config.dict()}
+
+    def _get_obs(self) -> np.ndarray:
+        s = self.state
+        inv = self.printing.inventory
+        eq = s.equipment
+        d = self.config.difficulty
+        f = self.failures
+        obs = np.array([
+            s.temp_c / 50.0,
+            (s.o2_percent() - 21.0) / 10.0,
+            (s.co2_ppm() - 400.0) / 5000.0,
+            s.water_kg / 5000.0,
+            s.food_kg / 2000.0,
+            s.plastic_kg / 1000.0,
+            s.methane_kg / 500.0,
+            s.hydrogen_kg / 300.0,
+            s.crop_biomass_kg / 600.0,
+            s.fish_kg / 150.0,
+            s.chicken_kg / 80.0,
+            s.crew_health / 100.0,
+            s.crew_mood / 100.0,
+            s.radiation_dose_sv / 3.0,
+            s.volume_m3 / 3000.0,
+            s.shielding_m / 4.0,
+            s.solar_area_m2 / 4000.0,
+            self.battery.soc(),
+            self.battery.capacity_kwh / self.battery.capacity_kwh_initial,
+            len(self.printing.queue) / 15.0,
+            1.0 if self.printing.current else 0.0,
+            self.printing.printer_health,
+            inv.get("solar_panel", 0) / 30.0,
+            inv.get("regolith_bag", 0) / 30.0,
+            inv.get("structure_brace", 0) / 30.0,
+            inv.get("o2_filter", 0) / 30.0,
+            inv.get("tool_kit", 0) / 30.0,
+            eq.get("structure", 1.0),
+            eq.get("solar", 1.0),
+            eq.get("o2", 1.0),
+            eq.get("co2", 1.0),
+            eq.get("printer", 1.0),
+            eq.get("mining", 1.0),
+            s.regolith_kg / 20000.0,
+            math.sin(s.time_sol * 2 * math.pi),
+            self.dust_storm.tau / 8.0,
+            1.0 if self.dust_storm.active else 0.0,
+            s.time_sol / 1000.0,
+            d.equipment_degradation_rate,
+            d.battery_aging_rate,
+            d.eva_risk_multiplier,
+            # V17: Failure obs
+            1.0 if f.water_leak_active else 0.0,
+            f.leak_duration_sols,
+            1.0 if f.comms_blackout_active else 0.0,
+            f.blackout_duration_sols,
+            f.spares_kg / 500.0,
+        ], dtype=np.float32)
+        return obs
+
+    def step(self, action: np.ndarray):
+        action = np.clip(action, 0.0, 1.0)
+        reward = self._physics_step(action)
+        self.state.time_sol += DT_SOL
+        terminated = self._check_failure()
+        truncated = False
+        info = {"dust_tau": self.dust_storm.tau}
+        return self._get_obs(), reward, terminated, truncated, info
+
+    def _physics_step(self, a: np.ndarray) -> float:
+        s = self.state
+        c = self.config
+        d = c.difficulty
+        reward = 0.0
+        regolith_mined = 0.0
+
+        # V17: Port failures (modifies action/reward)
+        failure_reward = self.failures.update(s, d, a)
+        reward += failure_reward
+
+        # === Dust storm & insolation ===
+        self.dust_storm.update(s.time_sol, d)
+        phase = (s.time_sol * 2 * math.pi) % (2 * math.pi)
+        diurnal = max(0.0, math.sin(phase + math.pi / 6)) ** 2
+        transmittance = math.exp(-self.dust_storm.tau * 1.2)
+        solar_kw = (s.solar_area_m2 *
+                    AVG_INSOLATION_W_M2 / 1000.0 *
+                    0.38 * s.equipment["solar"] *
+                    diurnal * transmittance)
+        self.battery.charge(solar_kw, DT_HOURS)
+
+        # === Crew consumption ===
+        crew = c.crew_size
+        s.o2_kg -= CREW_O2_KG_SOL * crew * DT_SOL
+        s.co2_kg += CREW_CO2_KG_SOL * crew * DT_SOL
+        s.water_kg -= (CREW_WATER_DRINK_KG_SOL + CREW_WATER_HYGIENE_KG_SOL * 0.4) * crew * DT_SOL
+        s.food_kg -= CREW_FOOD_KG_SOL * crew * DT_SOL
+
+        # === Food production ===
+        light_score = min(1.0, a[10] * s.solar_area_m2 / max(400.0, s.crop_biomass_kg * 2.0))
+        crop_growth = s.crop_biomass_kg * c.crop_growth_rate_per_sol * light_score * DT_SOL
+        s.crop_biomass_kg += crop_growth
+        harvest = (crop_growth * c.crop_edible_fraction +
+                   s.fish_kg * 0.09 * a[11] +
+                   s.chicken_kg * 0.06 * a[12]) * DT_SOL
+        s.food_kg += harvest
+        reward += harvest * 0.8
+
+        # === ISRU ===
+        if a[13] > 0.6 and s.equipment["o2"] > 0.5:
+            co2_used = min(s.co2_kg, a[13] * 3.0 * DT_HOURS)  # Realistic full-scale MOXIE ~100 g/h O2
+            o2_produced = co2_used * (32.0 / 44.0) * 0.62
+            s.o2_kg += o2_produced
+            s.co2_kg -= co2_used
+
+        if a[14] > 0.6 and s.hydrogen_kg > 2.0:
+            h2_used = min(s.hydrogen_kg, a[14] * 8.0 * DT_HOURS)
+            ch4 = h2_used * (16.0 / 8.0) * 0.80
+            water = h2_used * (18.0 / 4.0) * 0.80
+            s.methane_kg += ch4
+            s.water_kg += water
+            s.hydrogen_kg -= h2_used
+
+        if a[17] > 0.7:
+            regolith_mined = a[17] * 8.0 * DT_HOURS
+            s.regolith_kg += regolith_mined
+
+        # === Printing & pyrolysis ===
+        reward += self.printing.update(s, self.battery, a[19], a[18], regolith_mined)
+
+        # === Queue jobs ===
+        for idx, part in zip([20,21,22,23,24], ["solar_panel","regolith_bag","structure_brace","o2_filter","tool_kit"]):
+            if a[idx] > 0.8 and self.printing.enqueue(part):
+                reward += 0.1
+
+        # === EVA actions (cost O2, time, risk) ===
+        eva_hours = 0.0
+        if a[25] > 0.8 and self.printing.apply_part("solar_panel", s):
+            eva_hours += CREW_EVA_TIME_H_PER_PART
+            reward += 6.0
+        if a[26] > 0.8 and self.printing.apply_part("regolith_bag", s):
+            eva_hours += CREW_EVA_TIME_H_PER_PART
+            reward += 7.0
+        if a[27] > 0.8 and self.printing.repair(s):
+            eva_hours += 2.0
+            reward += 5.0
+
+        if eva_hours > 0:
+            o2_eva = eva_hours * CREW_EVA_O2_KG_PER_H
+            if s.o2_kg < o2_eva + 20:
+                reward -= 15.0
+            else:
+                s.o2_kg -= o2_eva
+            if random.random() < 0.003 * eva_hours * d.eva_risk_multiplier:
+                s.crew_health -= 30.0
+                reward -= 20.0
+
+        # === Power load ===
+        heater_kw = a[0] * 15.0
+        core_kw = 10.0 + np.sum(a[1:10]) * 2.5
+        bio_kw = a[10] * 8.0 + a[11] * 3.0 + a[12] * 2.0
+        total_load = heater_kw + core_kw + bio_kw
+        self.battery.discharge(total_load, DT_HOURS)
+
+        # === Thermal (realistic night) ===
+        exterior_t = -60.0 + 50.0 * math.sin(phase)
+        surface_area = (s.volume_m3 * 6) ** (2/3)
+        heat_loss = (s.temp_c - exterior_t) * 0.018 * surface_area / 500.0
+        thermal_mass = s.volume_m3 * 1.2 + s.shielding_m * 3000.0
+        s.temp_c += (heater_kw * 0.88 - heat_loss) / thermal_mass * 60.0 * DT_HOURS
+        s.temp_c = np.clip(s.temp_c, -40.0, 50.0)
+        reward -= abs(s.temp_c - c.target_temp_c) * 0.3
+
+        # === Radiation ===
+        shield_eff = min(0.98, s.shielding_m / 2.8)
+        daily_dose = BASE_GCR_SV_PER_SOL * (1.0 - shield_eff) * DT_SOL * HOURS_PER_SOL
+        if random.random() < d.spe_freq_per_year / (365.25 * 24 / DT_HOURS):
+            daily_dose += SPE_FLARE_SV * (1.0 - shield_eff * 0.8)
+        s.radiation_dose_sv += daily_dose
+
+        # === Health & mood ===
+        if s.food_kg < 150:     s.crew_health -= 30.0
+        if s.o2_percent() < 16: s.crew_health -= 50.0
+        if s.co2_ppm() > 8000:  s.crew_health -= 40.0
+        if s.water_kg < 300:    s.crew_health -= 40.0
+        if s.radiation_dose_sv > 0.8: s.crew_health -= 25.0
+        s.crew_mood += (s.crew_health - 70) * 0.01
+        s.crew_mood = np.clip(s.crew_mood, 10.0, 100.0)
+
+        # === Equipment degradation ===
+        deg = 1e-6 * d.equipment_degradation_rate
+        for k in s.equipment:
+            if k != "structure":
+                s.equipment[k] -= deg * random.uniform(0.8, 1.2)
+        s.equipment = {k: max(0.05, v) for k, v in s.equipment.items()}
+
+        # === Battery aging ===
+        self.battery.age(d.battery_aging_rate)
+
+        s.crew_health = np.clip(s.crew_health, 0.0, 100.0)
+        reward += np.log1p(s.crew_health) * 0.9
+        reward += self.battery.soc() ** 2 * 3.5
+
+        return float(reward)
+
+    def _check_failure(self) -> bool:
+        s = self.state
+        return (s.crew_health <= 0.0 or
+                s.o2_kg < 30.0 or
+                s.water_kg < 150.0 or
+                s.food_kg < 80.0 or
+                self.battery.energy_kwh < 30.0 or
+                s.temp_c < -25.0 or
+                self.failures.spares_kg <= 0 and s.crew_mood < 20.0)  # V17: Despair clause
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="V17 OrbitalClass++ Analog Apocalypse")
+    parser.add_argument("--sols", type=float, default=3650.0, help="Mission duration in Mars sols")
+    parser.add_argument("--difficulty", type=str, default="CHAPEA", help="Difficulty: Nightmare|CHAPEA")
+    args = parser.parse_args()
+
+    config = MarsConfig()
+    config.difficulty.name = args.difficulty
+    if args.difficulty == "CHAPEA":
+        config.difficulty.water_leak_freq_sol = 0.05
+        config.difficulty.comms_blackout_prob = 0.01
+        config.difficulty.psych_sabotage_threshold = 30.0
+
+    env = MarsHabitatEnv(config)
+    obs, _ = env.reset(seed=42)
+    print(f"🚀 V17 OrbitalClass++ — {args.difficulty} mode — {args.sols} sol mission")
+    print("NASA analogs integrated: Leaks, blackouts, and crew-induced chaos await.")
+
+    steps = int(args.sols / DT_SOL)
+    for step in range(steps):
+        action = np.random.uniform(0.2, 0.9, size=28)
+        obs, rew, term, trunc, info = env.step(action)
+
+        if step % (24 * 30) == 0:
+            s = env.state
+            f = env.failures
+            status = ""
+            if f.water_leak_active: status += " [LEAK] "
+            if f.comms_blackout_active: status += " [BLACKOUT] "
+            print(f"Sol {s.time_sol:.0f} | H:{s.crew_health:.0f}% M:{s.crew_mood:.0f}% {status}"
+                  f"| Food:{s.food_kg:.0f}kg | O2:{s.o2_percent():.1f}% | Shield:{s.shielding_m:.2f}m "
+                  f"| Solar:{s.solar_area_m2:.0f}m² | Bat:{env.battery.soc()*100:.1f}% ({env.battery.capacity_kwh:.0f}kWh) "
+                  f"| Tau:{info['dust_tau']:.2f} | Dose:{s.radiation_dose_sv:.3f}Sv | Spares:{f.spares_kg:.0f}kg")
+
+        if term:
+            print("💀 CREW DEAD — Analogs were too real. Mars wins again.")
+            break
+    else:
+        print("🌍🎉 PERMANENT HUMAN PRESENCE ON MARS ACHIEVED — You beat the logs!")
